@@ -1,0 +1,526 @@
+
+---
+title: "WGCNA for ALS Data" 
+author: "Priya Schramm"
+date: "`r Sys.Date()`"
+output: 
+  prettydoc::html_pretty:
+    theme: hpstr
+    toc: yes
+---
+
+# WGCNA Analysis of ALS RNA-seq Data 🧬
+
+## Introduction
+
+Weighted Gene Co-expression Network Analysis (WGCNA) is a pipeline to find interconnected genes based on how their expression changes together, then correlate these genes with traits and conditions of interest. These groups, called **modules**, often represent genes involved in common biological processes, molecular functions, or cellular locations.
+
+This tutorial analyzes RNA-seq data from individuals with amyotrophic lateral sclerosis (ALS) and control samples. The workflow demonstrates how to:
+
+- preprocess RNA-seq expression data
+- construct a weighted gene co-expression network
+- identify modules of co-expressed genes
+- determine which modules are associated with ALS
+- visualize the results
+- export module networks for Cytoscape
+- identify long non-coding RNAs within disease-associated modules
+
+Although this workflow uses an ALS dataset, the same principles can be applied to many transcriptomic datasets.
+
+## Load Required Packages 
+
+Before beginning the analysis, load the R packages required throughout the workflow.
+
+These packages provide functions for:
+
+- importing and manipulating data
+- constructing weighted gene co-expression networks
+- visualizing results
+- calculating module-trait correlations
+- exporting networks for Cytoscape visualization
+
+Analysis parameters are also defined so they can easily be modified later if desired.
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+# Assist with graphics display (optional)
+options(bitmapType= "cairo") 
+
+# Load libraries 
+packages <- c(
+  "WGCNA",
+  "DESeq2",
+  "tidyverse",
+  "CorLevelPlot",
+  "gridExtra",
+  "igraph",
+  "fastDummies"
+)
+
+library(rmdformats)
+library(prettydoc)
+
+lapply(packages, library, character.only = TRUE)
+allowWGCNAThreads() #allow multi-threading 
+
+# Parameters
+min_tpm <- 1
+min_samples <- 5
+soft_power <- 10
+network_type <- "signed"
+
+```
+
+# 1. Load the Expression Data 🔬
+
+The first step is to import the normalized gene expression matrix (TPM) together with the sample metadata.
+
+The metadata contains clinical information for each sample, while the TPM matrix contains gene expression values that will be used to build the co-expression network.
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+metadata <- read.csv(
+  "/gpfs/commons/groups/compbio/projects/ao_projects/RNA/Internship_2026/data/als_metadata.csv",
+  header = TRUE
+)
+
+tpm <- read.csv(
+  "/gpfs/commons/groups/compbio/projects/ao_projects/RNA/Internship_2026/data/als_gex_tpm.csv",
+  row.names = 1,
+  check.names = FALSE
+)
+
+```
+
+# 2. Prepare the Data 🧮
+
+WGCNA requires an expression matrix with samples as rows and genes as columns.
+
+Before constructing the network, the metadata are aligned with the expression matrix to ensure that every sample matches correctly. Low-expressed genes are then removed to reduce noise and improve network quality. Finally, the expression values are log-transformed and transposed into the format expected by WGCNA.
+
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+metadata <- metadata[match(colnames(tpm), metadata$RNA), ] #align the columns
+stopifnot(all(metadata$RNA == colnames(tpm)))
+
+keep <- rowSums(tpm >= 1) >= 5 # Adjust parameters to filter to desired number of genes
+table(keep)
+tpm_filtered <- tpm[keep, ]
+dim(tpm_filtered)
+
+datExpr <- log2(tpm_filtered + 1)
+datExpr <- t(datExpr) # Transpose: rows = samples, columns = genes
+
+```
+
+# 3. Quality Control 📈
+
+Quality control is an important step before constructing a co-expression network.
+
+Hierarchical clustering is used to identify potential outlier samples, while principal component analysis (PCA) provides an overview of variation among samples. These visualizations help determine whether any samples should be excluded before proceeding.
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+gsg <- goodSamplesGenes(datExpr)
+summary(gsg)
+gsg$allOK 
+
+# Detect outlier samples using hierarchical clustering
+htree <- hclust(dist(datExpr), method = "average")
+
+plot(htree,
+     main = "Sample clustering",
+     xlab = "",
+     sub = "",
+     labels = FALSE,
+     cex = 0.6)
+
+# Compute PCA of joint dataset
+
+pca_res <- prcomp(datExpr, scale. = FALSE)
+proportion_variance_per_PC <- summary(pca_res)$importance[2,] * 100
+pca_comp <- data.frame(pca_res$x)
+
+pca_plot <- ggplot(pca_comp, aes(x = PC1, y = PC2,
+                          col = metadata$Sample.Source)) +
+  geom_point(size = 2.5) +
+  xlab(paste0("PC 1 (", round(proportion_variance_per_PC[1], 1), "%)")) +
+  ylab(paste0("PC 2 (", round(proportion_variance_per_PC[2], 1), "%)")) +
+  ggtitle("")
+
+
+print(pca_plot)
+
+```
+
+The visualized sample clustering tree and PCA plot show that the data do not contain outliers. The data form clusters of similar gene expression profiles in both graphs. 
+
+# 4. Select a Soft-Thresholding Power 📉
+
+WGCNA converts gene-gene correlations into network connection strengths using a soft-thresholding power.
+
+Different powers are evaluated to determine which best approximates a scale-free network topology while preserving sufficient connectivity between genes. This selected value will be used throughout the remainder of the analysis.
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+ powers <- c(1:10, seq(from = 12, to = 14, by = 2)) # Candidate soft-thresholding powers
+
+ sft <- pickSoftThreshold(
+  datExpr,
+   powerVector = powers,
+   networkType = "signed",
+  verbose = 5)
+ sft.data <- sft$fitIndices
+
+ scale_free_plot <- ggplot(sft.data,
+              aes(x = Power, y = -sign(slope) * SFT.R.sq, label = Power)) +
+   geom_point() +
+   geom_text(nudge_y = 0.02) +
+   geom_hline(yintercept = 0.8, color = "red") +
+   labs(
+     title = "Scale independence",
+     x = "Soft-thresholding power",
+     y = "Scale-free topology fit (signed R²)"
+   ) +
+   theme_classic()
+
+ connectivity_plot <- ggplot(sft.data,
+              aes(x = Power, y = mean.k., label = Power)) +
+   geom_point() +
+   geom_text(nudge_y = 100) +
+   labs(
+     title = "Mean connectivity",
+     x = "Soft-thresholding power",
+     y = "Mean connectivity"
+   ) +
+   theme_classic()
+ 
+ grid.arrange(scale_free_plot, connectivity_plot, nrow = 2)
+ 
+```
+
+A soft-thresholding power of 10 was chosen because it was the lowest power right before the scale-free topology fit index (R²) flattens out, while maintaining a high mean connectivity so that the network does not lose too many connections.
+
+# 5. Construct the Gene Co-expression Network 🧬
+
+After selecting the soft-thresholding power, the weighted gene co-expression network is constructed using the blockwiseModules function.
+
+Genes with similar expression patterns are grouped into modules using hierarchical clustering and dynamic tree cutting. Each module is assigned a unique color for easy identification.
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+datExpr[] <- sapply(datExpr, as.numeric) # convert to numeric
+soft_power <- 10 # Selected based on pickSoftThreshold() results, where signed R² exceeded 0.8.
+temp_cor <- cor
+cor <- WGCNA::cor
+
+bwnet <- blockwiseModules(datExpr, 
+                          maxBlockSize = 40000, 
+                          TOMType = "signed",
+                          power = soft_power,
+                          mergeCutHeight = 0.25,
+                          numericLabels = FALSE,
+                          randomSeed = 1234,
+                          verbose = 3)
+
+saveRDS(bwnet, file = "bwnet.rds") # Saves the bwnet object to avoid rerunning
+
+cor <- temp_cor
+
+#bwnet <- readRDS("bwnet.rds") (Use this to call saved bwnet value)
+
+```
+
+# 6. Visualize Gene Modules 📊
+
+Once the network has been constructed, the identified modules can be visualized with a hierarchical clustering dendrogram.
+
+This figure shows a before and after of how genes are grouped into modules and how similar modules are merged during network construction.
+
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+module_eigengenes <- bwnet$MEs
+head(module_eigengenes) 
+table(bwnet$colors)
+length(unique(bwnet$colors)) #number modules
+
+plotDendroAndColors(
+  bwnet$dendrograms[[1]],
+  cbind(bwnet$unmergedColors, bwnet$colors),
+  c("unmerged", "merged"),
+  dendroLabels = FALSE,
+  addGuide = TRUE,
+  hang = 0.03,
+  guideHang = 0.05
+)
+
+```
+
+# 7. Relate Modules to Clinical Traits 🩺
+
+WGCNA summarizes each module using its module eigengene, representative of the gene expression profile of each module.
+
+Module eigengenes are correlated with clinical variables such as ALS status, age, sex, disease duration, and tissue source to identify biologically meaningful modules.
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+rownames(metadata) <- metadata$RNA
+
+traits <- metadata %>%
+  transmute(
+    ALS = ifelse(Subject.Group == "ALS Spectrum MND", 1, 0),
+    Age = Age.at.Death,
+    Disease_Duration = Disease.Duration.in.Months,
+    Tissue = Sample.Source,
+    Sex = ifelse(Sex == "Male", 1, 0))
+
+traits <- fastDummies::dummy_cols(traits,
+                        select_columns = c("Tissue"),
+                        remove_selected_columns = TRUE)
+
+
+nSamples <- nrow(datExpr)
+
+
+# Find module eigengenes
+module.trait.corr <- cor(module_eigengenes,
+                         traits,
+                         use = 'p')
+
+# Find module-trait correlation p-values
+module.trait.pvalue <- corPvalueStudent(
+  module.trait.corr,
+  nSamples
+)
+
+
+```
+
+# 8. Identify ALS-Associated Modules 🧠
+
+The module-trait correlations are ranked to determine which gene modules show the strongest association with ALS.
+
+Modules with statistically significant correlations become candidates for downstream biological interpretation. The top modules found in this analysis were red, black, brown, and grey.
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+module.trait.corr[, "ALS"] 
+
+module.trait.pvalue[, "ALS"]
+
+# Rank modules for correlation with ALS
+als_results <- data.frame(
+  Module = rownames(module.trait.corr),
+  Correlation = module.trait.corr[, "ALS"],
+  Pvalue = module.trait.pvalue[, "ALS"]
+)
+
+# Correlation ranking
+als_results <- als_results[order(abs(als_results$Correlation), decreasing = TRUE), ]
+
+als_results
+
+# Identify significant modules
+sig_modules <- subset(als_results, Pvalue < 0.01) 
+
+```
+
+# 9. Visualize Module-Trait Relationships 📊
+
+A heatmap provides a visualization of the correlation between each module and clinical trait in the metadata.
+
+The magnitude and direction of each correlation can be interpreted using the color scale. Blocks with *** show the strongest correlation and can be candidates for further module analysis.
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+heatmap.data <- cbind(module_eigengenes, traits)
+module.names <- colnames(module_eigengenes)
+trait.names <- colnames(traits)
+
+pdf("module_trait_heatmap.pdf", width = 16, height = 8)
+
+CorLevelPlot(
+  heatmap.data,
+  x = module.names,
+  y= trait.names,
+  col = c("blue1", "skyblue", "white", "pink", "red")
+)
+
+dev.off()
+
+```
+
+# 10. Export Genes from a Module 💻
+
+Once an interesting module has been identified, its genes can be extracted for downstream analyses.
+
+In this example, Ensembl gene identifiers are converted to gene symbols before exporting the module gene list, to use for Webgestalt enrichment analysis.
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+gene_info <- read.csv("/gpfs/commons/groups/compbio/resources/Gencode/gencode.v30_geneInfo.csv",
+                      header=TRUE,
+                      row.names=5)
+
+ensembl_to_gene_symbol_map <- setNames(gene_info$symbol, rownames(gene_info))
+
+select.genes <- colnames(datExpr)[bwnet$colors == "red"] # Select a module of interest
+
+write.table(unname(ensembl_to_gene_symbol_map[select.genes]), "/nfs/home/pschramm/Week_1/red_module.txt",
+            row.names = F, quote = F) # Gene names of selected module are written to .txt file for downstream analysis
+
+```
+
+# 11. Export the Network for Cytoscape 🔬
+
+After producing the network through WGCNA, we use Cytoscape to provide more precise network visualizations.
+
+Here, the strongest gene-gene connections within a selected module (red) are exported as node and edge files. These files can be imported directly into Cytoscape for network visualization and hub gene identification.
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+# Isolate module genes
+module <- "red"
+inModule <- bwnet$colors == module
+moduleExpr <- datExpr[, inModule]
+
+# Calculate the adjacency matrix for genes in the module
+moduleAdjacency <- adjacency(
+  moduleExpr,
+  power = soft_power,
+  type = "signed"
+)
+
+TOM <- TOMsimilarity(moduleAdjacency,
+                    TOMType = "signed")
+
+moduleGenes <- colnames(moduleExpr)
+
+moduleGeneSymbols <- ensembl_to_gene_symbol_map[moduleGenes]
+
+# Calculate connectivity
+kWithin <- rowSums(moduleAdjacency)
+
+# Keep the top 50 most connected genes
+top <- order(kWithin, decreasing = TRUE)[1:50]
+
+# Subset TOM
+moduleTOM_top <- TOM[top, top]
+moduleGeneSymbols_top <- moduleGeneSymbols[top]
+
+# Connectivity of the top genes
+kWithin_top <- kWithin[top]
+
+# Extract unique TOM values
+tomValues <- moduleTOM_top[upper.tri(moduleTOM_top)]
+
+# Keep only the top 5% of TOM edge strength
+cutoff <- quantile(tomValues, 0.95)
+
+# Remove weaker edges
+moduleTOM_filtered <- moduleTOM_top
+moduleTOM_filtered[moduleTOM_filtered < cutoff] <- 0
+diag(moduleTOM_filtered) <- 0
+
+# Export edge file for Cytoscape
+exportNetworkToCytoscape(
+  moduleTOM_filtered,
+  edgeFile = "redModuleEdges_final.txt",
+  weighted = TRUE,
+  threshold = 0,
+  nodeNames = moduleGeneSymbols_top
+)
+
+# Create custom node file with connectivity
+nodeData <- data.frame(
+  id = moduleGeneSymbols_top,
+  module = module,
+  kWithin = kWithin_top
+)
+
+# Export node data
+write.table(
+  nodeData,
+  file = "redModuleNodes_final.txt",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+```
+
+# 12. Identify Long Non-coding RNAs 🧬
+
+Finally, the selected module is explored further by identifying long non-coding RNAs (lncRNAs).
+
+Gene annotation information is used to filter the module for lncRNA genes, which are then exported for downstream analyses such as functional characterization.
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+# Select a module
+module <- "red"
+
+# Get Ensembl IDs of genes in the module
+moduleGenes <- colnames(datExpr)[bwnet$colors == module]
+
+# Get annotation info for those genes
+moduleInfo <- gene_info[moduleGenes, ]
+
+# Look at annotation columns
+table(moduleInfo$biotype) 
+
+# Filter for lincRNA (long non-coding)
+lncRNAs <- subset(moduleInfo, biotype == "lincRNA")
+
+# Write lncRNAs to a csv file
+write.csv(
+    lncRNAs,
+    "red_module_lncRNAs.csv",
+    row.names = TRUE
+)
+
+lncRNAs <- read.csv(
+    "red_module_lncRNAs.csv",
+    row.names = 1,
+    check.names = FALSE
+)
+
+# get a .txt file of the gene symbols for further analysis
+write.table(
+    lncRNAs$symbol,
+    "red_module_lncRNA_symbols.txt",
+    row.names = FALSE,
+    col.names = FALSE,
+    quote = FALSE
+)
+
+```
+
+# Summary 
+
+In this tutorial, we:
+
+- imported and prepared RNA-seq expression data
+- performed quality control
+- selected an appropriate soft-thresholding power
+- constructed a weighted gene co-expression network
+- identified co-expressed gene modules
+- associated modules with ALS and other clinical traits
+- exported a disease-associated module for Cytoscape
+- identified long non-coding RNAs within the selected module
+
+These steps provide a complete WGCNA workflow that can be adapted to many bulk RNA-seq datasets beyond ALS.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
